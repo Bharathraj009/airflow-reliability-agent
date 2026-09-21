@@ -1,0 +1,36 @@
+# Local environment files and credentials
+.env
+.env.*
+!.env.example
+secrets/
+*.pem
+*.key
+
+# Airflow runtime output and generated local configuration
+logs/*
+!logs/.gitkeep
+config/airflow.cfg
+config/*password*.json*
+airflow.db
+*.db
+*.log
+
+# Python caches, local environments, and temporary files
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+tmp/
+temp/
+*.tmp
+*.swp
+*.bak
+
+# Editor and OS files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
