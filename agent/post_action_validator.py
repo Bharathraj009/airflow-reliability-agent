@@ -1,7 +1,8 @@
 """Offline evidence checks, not remediation or an Airflow health check.
 
-Version 1 never produces VERIFIED_HEALTHY: no independent health evidence is
-available. NOT_REPAIRED means this read-only operation performed no repair,
+Execution-only validation never produces VERIFIED_HEALTHY. The separate
+assess_airflow_health function requires independent new-run REST observations.
+NOT_REPAIRED means this read-only operation performed no repair,
 not that we have queried the current live state of the incident.
 """
 
@@ -16,6 +17,28 @@ INCIDENT_FIELDS = ("dag_id", "dag_run_id", "task_id")
 VALIDATION_STATUSES = (
     "VERIFIED_HEALTHY", "NOT_REPAIRED", "INCONCLUSIVE", "EXECUTION_FAILED",
 )
+
+
+def assess_airflow_health(evidence):
+    """Derive health from NEW-run REST observations, never approval/AI claims."""
+    outcome = dict(repair_verified=False, verification_status="INCONCLUSIVE",
+                   reason="Independent new-run health evidence is incomplete.")
+    if (evidence.get("dag_id") != "reliability_demo" or evidence.get("trigger_status") != "CREATED"
+            or not isinstance(evidence.get("verification_dag_run_id"), str)
+            or not evidence["verification_dag_run_id"] or not evidence.get("original_dag_run_id")
+            or evidence["verification_dag_run_id"] == evidence["original_dag_run_id"]):
+        return outcome
+    tasks = evidence.get("task_states")
+    if not isinstance(tasks, dict):
+        return outcome
+    if evidence.get("dag_run_state") == "failed" or any(state in ("failed", "upstream_failed") for state in tasks.values()):
+        return dict(repair_verified=False, verification_status="VERIFICATION_FAILED", reason="The new DAG run or a task failed.")
+    required = {"start", "process_data", "data_quality_check", "end"}
+    if (evidence.get("dag_run_state") == "success" and required <= set(tasks)
+            and all(state == "success" for state in tasks.values())):
+        return dict(repair_verified=True, verification_status="VERIFIED_HEALTHY",
+                    reason="New DAG run and all required tasks succeeded, including the data quality check.")
+    return outcome
 
 
 def nonempty_text(value):

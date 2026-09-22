@@ -94,6 +94,12 @@ def evaluate_policy(proposal):
             "requires_human_approval": True,
         }
     risk, decision, eligible_action = ACTION_POLICY[action_type]
+    # Only the fixed demo proposal gains the named mutation permission. Existing
+    # destructive rules above still take precedence. No AI paths are authorized.
+    from agent.remediation_playbooks import PLAYBOOK, CONTROL_RELATIVE, PROPOSED_ACTION
+    if (action_type == "configuration_change" and proposal["target"] == CONTROL_RELATIVE
+            and proposal["proposed_action"] == PROPOSED_ACTION):
+        eligible_action = PLAYBOOK
     reasons = [f"Policy classifies {action_type} as {risk} risk, independently of the AI risk rating."]
     if action_type == "no_change":
         reasons.append("No change is proposed. Allow means a no-op, not permission to execute anything.")

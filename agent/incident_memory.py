@@ -33,6 +33,8 @@ def redact(value, secrets=()):
     """
     if isinstance(value, dict):
         return {key: redact(item, secrets) for key, item in value.items()}
+    if isinstance(value, list):
+        return [redact(item, secrets) for item in value]
     if not isinstance(value, str):
         return value
     for secret in sorted((item for item in secrets if isinstance(item, str) and item), key=len, reverse=True):
@@ -59,7 +61,7 @@ def _utc(value):
 def validate_incident(record):
     """Strict allowlisted schema; reject extra fields rather than storing secrets."""
     try:
-        if not isinstance(record, dict) or set(record) != BASE_FIELDS | set(SECTIONS):
+        if not isinstance(record, dict) or set(record) - {"playbook_attempt", "verification", "final_outcome"} != BASE_FIELDS | set(SECTIONS):
             raise ValueError
         if record["historical_only"] is not True:
             raise ValueError
@@ -114,9 +116,97 @@ def validate_incident(record):
             raise ValueError
         if record["policy"]["decision"] == "block" and approval["status"] != "BLOCKED":
             raise ValueError
+        if "playbook_attempt" in record:
+            _validate_playbook_attempt(record)
+        if "verification" in record or "final_outcome" in record:
+            _validate_verification(record)
     except (KeyError, TypeError, ValueError, OverflowError):
         raise ValueError("Malformed or inconsistent historical incident record.") from None
     return record
+
+
+def _validate_verification(record):
+    from agent.post_action_validator import assess_airflow_health
+    evidence = record["verification"]
+    if set(evidence) != {"original_dag_run_id", "verification_dag_run_id", "dag_id", "trigger_status", "dag_run_state", "task_states", "repair_verified", "verification_status", "reason"}:
+        raise ValueError
+    if (evidence["original_dag_run_id"] != record["dag_run_id"] or evidence["dag_id"] != record["dag_id"]
+            or not isinstance(evidence["verification_dag_run_id"], str)
+            or type(evidence["repair_verified"]) is not bool
+            or not isinstance(evidence["reason"], str) or not isinstance(evidence["task_states"], dict)
+            or not all(isinstance(key, str) and (value is None or isinstance(value, str)) for key, value in evidence["task_states"].items())
+            or evidence["verification_status"] not in ("VERIFIED_HEALTHY", "VERIFICATION_FAILED", "TIMEOUT", "INCONCLUSIVE")
+            or evidence["trigger_status"] not in ("NOT_TRIGGERED", "UNKNOWN", "CREATED")):
+        raise ValueError
+    attempt = record["playbook_attempt"]
+    if not attempt["execution"] or attempt["execution"]["status"] != "COMPLETED":
+        raise ValueError
+    derived = assess_airflow_health(evidence)
+    if evidence["repair_verified"] != (evidence["verification_status"] == "VERIFIED_HEALTHY"):
+        raise ValueError
+    if evidence["repair_verified"] and not derived["repair_verified"]:
+        raise ValueError
+    if record["final_outcome"] != {"state": evidence["verification_status"], "repair_verified": evidence["repair_verified"]}:
+        raise ValueError
+
+
+def _validate_playbook_attempt(record):
+    """Optional historical section; does not change old records or grant authority."""
+    from agent.approval_gate import validate_record
+    from agent.remediation_planner import validate_proposal
+    from agent.remediation_playbooks import PLAYBOOK, CONTROL_RELATIVE
+
+    attempt = record["playbook_attempt"]
+    fields = {"playbook", "proposal", "policy", "approval", "execution", "final_state", "repair_verified", "error"}
+    if not isinstance(attempt, dict) or set(attempt) != fields:
+        raise ValueError
+    if attempt["playbook"] != PLAYBOOK or attempt["repair_verified"] is not False:
+        raise ValueError
+    if attempt["error"] is not None and not isinstance(attempt["error"], str):
+        raise ValueError
+    try:
+        validate_proposal(attempt["proposal"])
+        approval = attempt["approval"]
+        if approval is not None:
+            validate_record(approval)
+            if any(approval[key] != record[key] for key in ("dag_id", "dag_run_id", "task_id")):
+                raise ValueError
+            if approval["proposed_action"] != attempt["proposal"]["proposed_action"]:
+                raise ValueError
+    except RuntimeError:
+        raise ValueError from None
+    policy = attempt["policy"]
+    if not isinstance(policy, dict) or set(policy) != {
+        "decision", "calculated_risk", "reasons", "allowed_actions", "blocked_actions", "requires_human_approval",
+    }:
+        raise ValueError
+    if (policy["decision"] not in ("block", "require_approval")
+            or policy["calculated_risk"] not in ("medium", "high")
+            or policy["requires_human_approval"] is not True):
+        raise ValueError
+    for key in ("reasons", "allowed_actions", "blocked_actions"):
+        if not isinstance(policy[key], list) or not all(isinstance(item, str) for item in policy[key]):
+            raise ValueError
+    execution = attempt["execution"]
+    if execution is not None:
+        if not isinstance(execution, dict) or set(execution) != {"playbook", "status", "dag_id", "task_id", "changes", "message"}:
+            raise ValueError
+        if (execution["playbook"] != PLAYBOOK or execution["status"] not in ("COMPLETED", "REFUSED", "FAILED")
+                or any(execution[key] != record[key] for key in ("dag_id", "task_id"))
+                or not isinstance(execution["message"], str) or not isinstance(execution["changes"], list)):
+            raise ValueError
+        expected_change = {"target": CONTROL_RELATIVE, "before": {"simulate_failure": True}, "after": {"simulate_failure": False}}
+        if execution["changes"] not in ([], [expected_change]):
+            raise ValueError
+        if execution["status"] == "COMPLETED":
+            if (not approval or approval["status"] != "APPROVED" or policy["decision"] != "require_approval"
+                    or PLAYBOOK not in policy["allowed_actions"] or execution["changes"] != [expected_change]
+                    or attempt["final_state"] != "REMEDIATION_APPLIED_PENDING_VALIDATION"):
+                raise ValueError
+    if attempt["final_state"] not in ("NOT_REPAIRED", "INCONCLUSIVE", "REMEDIATION_APPLIED_PENDING_VALIDATION"):
+        raise ValueError
+    if attempt["final_state"] == "REMEDIATION_APPLIED_PENDING_VALIDATION" and (not execution or execution["status"] != "COMPLETED"):
+        raise ValueError
 
 
 def build_incident_record(context, rca, remediation, policy, approval, execution, validation, *, incident_id, recorded_at, secrets=()):
@@ -203,5 +293,5 @@ def find_similar_incidents(context, incidents, *, limit=5):
             fields.append("exception_message_word_overlap")
         if score:
             matches.append({"incident": redact(record), "match_score": round(score, 4), "matched_fields": fields,
-                            "repair_verified": record["validation"]["repair_verified"], "historical_only": True})
+                            "repair_verified": record.get("final_outcome", record["validation"])["repair_verified"], "historical_only": True})
     return sorted(matches, key=lambda item: -item["match_score"])[:limit]

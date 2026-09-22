@@ -11,6 +11,7 @@ runtime/
 logs/*
 !logs/.gitkeep
 config/airflow.cfg
+config/reliability_demo_control.json
 config/*password*.json*
 airflow.db
 *.db

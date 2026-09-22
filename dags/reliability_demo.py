@@ -1,14 +1,27 @@
 """A tiny, manually triggered pipeline for learning Airflow fundamentals."""
 
 from datetime import datetime, timezone
+import json
+from pathlib import Path
 
 from airflow.sdk import DAG, task
 from airflow.providers.standard.operators.empty import EmptyOperator
 
 
-# Controlled failure toggle for reliability testing.
-# True simulates a source schema problem; False restores the successful demo.
-SIMULATE_FAILURE = True
+# Read at task execution time, so changing the control needs no DAG code edit.
+# config/ is already mounted here by Docker Compose. A missing file preserves
+# the failing demo by default; malformed controls fail safely instead of healing.
+DEMO_CONTROL = Path("/opt/airflow/config/reliability_demo_control.json")
+
+
+def simulate_failure():
+    if not DEMO_CONTROL.exists():
+        return True
+    control = json.loads(DEMO_CONTROL.read_text(encoding="utf-8"))
+    if (not isinstance(control, dict) or set(control) != {"simulate_failure"}
+            or type(control["simulate_failure"]) is not bool):
+        raise ValueError("Invalid synthetic demo control: expected a simulate_failure boolean.")
+    return control["simulate_failure"]
 
 
 # A DAG describes tasks and their dependencies. Defining it does not run it:
@@ -34,7 +47,7 @@ with DAG(
         # inside the task so the DAG still loads and start can succeed.
         # Airflow records this exception in the task logs and marks the task
         # failed; downstream tasks cannot run with the default all_success rule.
-        if SIMULATE_FAILURE:
+        if simulate_failure():
             raise ValueError(
                 'Source data validation failed: required source field "customer_id" '
                 'is missing. Check the upstream source schema before processing.'

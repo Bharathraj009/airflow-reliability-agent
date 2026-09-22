@@ -24,6 +24,8 @@ from agent.policy_engine import evaluate_policy
 from agent.post_action_validator import validate_post_action
 from agent.rca_analyzer import analyze_context, compact_context, validate_rca
 from agent.remediation_planner import propose_remediation, validate_proposal
+from agent.remediation_playbooks import identify_playbook, build_playbook_proposal, run_playbook
+from agent.airflow_rerun import rerun_and_verify
 
 
 def utc_now():
@@ -32,6 +34,58 @@ def utc_now():
 
 def new_id():
     return str(uuid4())
+
+
+def offer_playbook(context, investigation_approval, *, clock, id_factory, secrets):
+    """A separate authorization lifecycle. History and investigation cannot approve it."""
+    playbook = identify_playbook(context)
+    if playbook is None:
+        return None
+    proposal = build_playbook_proposal(context)
+    policy = evaluate_policy(proposal)
+    attempt = dict(playbook=playbook, proposal=proposal, policy=policy, approval=None,
+                   execution=None, final_state="NOT_REPAIRED", repair_verified=False, error=None)
+    display("Known Remediation Playbook Available", {
+        "playbook": playbook, "target": proposal["target"],
+        "proposed_action": proposal["proposed_action"],
+        "calculated_risk": policy["calculated_risk"], "policy_decision": policy["decision"],
+    }, secrets)
+    invoked = False
+    try:
+        approval_id = id_factory()
+        if approval_id == investigation_approval["approval_id"]:
+            raise ValueError("A separate approval ID is required.")
+        initial = create_approval_record(context, proposal, policy, approval_id=approval_id)
+        attempt["approval"] = initial
+        if policy["decision"] == "block":
+            display("Playbook BLOCKED; no approval offered.", initial, secrets)
+            return attempt
+        print("A predefined remediation can modify the synthetic demo control.\n"
+              "The next approval applies only to this exact playbook; reject to stop.")
+        approval = prompt_for_approval(dict(initial))
+        validate_record(approval)
+        if any(approval[key] != initial[key] for key in initial if key not in (
+            "status", "approved_by", "decision_timestamp",
+        )):
+            raise ValueError("Playbook approval target changed.")
+        attempt["approval"] = approval
+        if approval["status"] != "APPROVED":
+            return attempt
+        # Authorization/freshness/state checks remain in the existing playbook.
+        invoked = True
+        result = run_playbook(context, proposal, policy, approval,
+                              current_approval_id=approval_id, now=clock())
+        attempt["execution"] = result
+        if result["status"] == "COMPLETED":
+            attempt["final_state"] = "REMEDIATION_APPLIED_PENDING_VALIDATION"
+        elif result["status"] == "FAILED":
+            attempt["final_state"] = "INCONCLUSIVE"
+        display("Controlled Remediation Result", result, secrets)
+    except Exception:
+        attempt["error"] = "Playbook stage failed safely; no retry attempted."
+        # After invocation an exception cannot prove that no change occurred.
+        attempt["final_state"] = "INCONCLUSIVE" if invoked else "NOT_REPAIRED"
+    return attempt
 
 
 def display(label, value, secrets=()):
@@ -46,7 +100,7 @@ def display(label, value, secrets=()):
     print(json.dumps(clean(value), indent=2, ensure_ascii=False), flush=True)
 
 
-def process_incident(context, *, memory_path=DEFAULT_STORE, secrets=(), clock=utc_now, id_factory=new_id):
+def process_incident(context, *, memory_path=DEFAULT_STORE, secrets=(), clock=utc_now, id_factory=new_id, airflow_token=None):
     """Process one compact context. Dependency functions can be mocked offline.
 
     Return a report even if a stage fails. Incomplete cycles are not fabricated
@@ -132,11 +186,38 @@ def process_incident(context, *, memory_path=DEFAULT_STORE, secrets=(), clock=ut
         else:
             report["final_incident_state"] = validation["validation_status"]
 
+        if (execution["status"] == "COMPLETED"
+                and execution["operation"] == ALLOWED_OPERATION
+                and validation["validation_status"] == "NOT_REPAIRED"):
+            stage = "known remediation playbook"
+            attempt = offer_playbook(context, approval, clock=clock, id_factory=id_factory, secrets=secrets)
+            if attempt is not None:
+                report["playbook_attempt"] = attempt
+                report["final_incident_state"] = attempt["final_state"]
+                if (airflow_token and attempt["error"] is None
+                        and attempt["approval"] is not None and attempt["approval"]["status"] == "APPROVED"
+                        and attempt["execution"] is not None and attempt["execution"]["status"] == "COMPLETED"):
+                    stage = "Airflow rerun verification"
+                    verification = rerun_and_verify(
+                        context, attempt, token=airflow_token,
+                        current_approval_id=attempt["approval"]["approval_id"],
+                        verification_run_id="manual__reliability_" + id_factory(), now=clock(),
+                    )
+                    report["verification"] = verification
+                    report["repair_verified"] = verification["repair_verified"]
+                    report["final_incident_state"] = verification["verification_status"]
+                    display("Independent Airflow Verification:", verification, secrets)
+
         stage = "incident persistence"
         record = build_incident_record(
             context, rca, proposal, policy, approval, execution, validation,
             incident_id=report["incident_id"], recorded_at=clock(), secrets=secrets,
         )
+        if "playbook_attempt" in report:
+            record["playbook_attempt"] = report["playbook_attempt"]
+        if "verification" in report:
+            record["verification"] = report["verification"]
+            record["final_outcome"] = {"state": report["final_incident_state"], "repair_verified": report["repair_verified"]}
         append_incident(record, memory_path, secrets=secrets)
         report["memory"]["incident_stored"] = True
     except Exception:
@@ -169,10 +250,12 @@ def run_workflow(task_id=None, *, memory_path=DEFAULT_STORE):
         raise RuntimeError("Set GROQ_API_KEY for the existing AI pipeline.")
     reports = []
     for context in contexts:
-        report = process_incident(context, memory_path=memory_path, secrets=secrets)
+        report = process_incident(context, memory_path=memory_path, secrets=secrets, airflow_token=token)
         reports.append(report)
         if report["error"] or report["approval"]["status"] in ("BLOCKED", "REJECTED", "PENDING_APPROVAL"):
             break
+        if "playbook_attempt" in report:
+            break  # One demo mutation offer per CLI invocation, never retry older runs.
     return reports
 
 

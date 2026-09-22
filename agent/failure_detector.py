@@ -20,7 +20,7 @@ RECENT_RUN_LIMIT = 10  # "Recent" means the latest 10 failed runs by start date.
 TIMEOUT_SECONDS = 15
 
 
-def request_json(path, token=None, payload=None):
+def request_json(path, token=None, payload=None, timeout=TIMEOUT_SECONDS):
     """Send a GET, or a POST when a JSON payload is supplied."""
     headers = {"Accept": "application/json"}
     data = None
@@ -32,7 +32,7 @@ def request_json(path, token=None, payload=None):
 
     request = Request(BASE_URL + path, data=data, headers=headers)
     try:
-        with urlopen(request, timeout=TIMEOUT_SECONDS) as response:
+        with urlopen(request, timeout=timeout) as response:
             return json.load(response)
     except HTTPError as exc:
         # Do not print request headers, credentials, or server response bodies.
