@@ -76,6 +76,22 @@ verification_status:  VERIFIED_HEALTHY
 
 The original failed run remains historical evidence. Recovery is established by the separate verification run.
 
+## Demo Evidence
+
+### Airflow Failure → Verified Recovery
+
+![Airflow showing the failed demo run and successful agent-created verification run](docs/screenshots/airflow-failure-recovery.png)
+
+The original `reliability_demo` run failed at `process_data`. The later `manual__reliability_...` run was created by the reliability agent for independent verification, and Airflow reports it as **Success**.
+
+### Governed Remediation
+
+![Agent output showing human approval, controlled remediation, and independent Airflow verification](docs/screenshots/agent-controlled-remediation.png)
+
+The known failure matched the allowlisted `restore_customer_id_demo_source` playbook. Deterministic policy required human approval, and the controlled remediation changed only `simulate_failure` from `true` to `false`. The agent then created a new Airflow run and inspected its task states.
+
+The agent does not mark a repair healthy because an LLM says the fix worked. `VERIFIED_HEALTHY` is produced only after the new Airflow run and all required tasks, including `data_quality_check`, succeed.
+
 ## Safety Design
 
 - **LLM reasoning does not authorize execution.** Model output is validated data; no arbitrary shell, SQL, Docker commands, or production changes are executed from it.
